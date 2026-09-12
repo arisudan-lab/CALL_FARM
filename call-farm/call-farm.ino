@@ -14,6 +14,7 @@ const char* password = "12345678";
 #define DHTTYPE DHT11       // DHT 11
 #define MOISTURE_PIN 35     // Analog pin for Soil Moisture
 #define RELAY_PIN 26        // Pin for the Relay Module
+#define PUMP_BUTTON_PIN 27  // Physical push button: connect between GPIO27 and GND
 #define SIM800_RX_PIN 16    // ESP32 RX2
 #define SIM800_TX_PIN 17    // ESP32 TX2
 
@@ -38,6 +39,7 @@ bool pumpIsOn = false;      // Tracks the logical state of the pump
 // --- SIM800L Variables ---
 String networkName = "Wait..."; // Stores "Kolkata" etc.
 String signalStrength = "0";    // Stores "14" etc.
+String callerNumber = "";       // Last incoming caller number
 
 // --- Settings Variables ---
 bool isAutoMode = true;           // Default to Auto mode
@@ -49,8 +51,16 @@ unsigned long previousSimMillis = 0;
 const long sensorInterval = 2000; // Update sensors every 2 seconds
 const long simInterval = 10000;   // Check signal/network every 10 seconds
 
+// Physical button debounce
+int lastButtonReading = HIGH;
+int stableButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
 void updateOLED();
+void handlePhysicalButton();
 String sendATCommand(String command, const int timeout);
+void sendSensorSMS(const String &recipient);
 
 // ==========================================
 // HTML & CSS FOR THE WEBSITE
@@ -61,7 +71,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ESP32 Plant Monitor</title>
+  <title>Smart Plant Monitor</title>
   <style>
     :root {
       --primary: #8bc34a;       
@@ -174,7 +184,14 @@ const char index_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <h1>Smart Plant Monitor</h1>
+  <div style="display:flex; justify-content:flex-end; max-width:900px; margin:0 auto 10px;">
+    <select id="languageSelect" onchange="changeLanguage()" style="padding:8px 12px; border-radius:8px; background:#162c15; color:#e8f5e9; border:1px solid #2b5329;">
+      <option value="en">English</option>
+      <option value="hi">हिन्दी</option>
+      <option value="bn">বাংলা</option>
+    </select>
+  </div>
+  <h1 data-i18n="title">Smart Plant Monitor</h1>
   <div class="grid">
     
     <div class="card">
@@ -183,7 +200,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         <path class="circle temp-circle" id="temp-ring" stroke-dasharray="0, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
         <text x="18" y="18" class="percentage-text" id="temp-val">--°C</text>
       </svg>
-      <div class="label">Temperature</div>
+      <div class="label" data-i18n="temperature">Temperature</div>
     </div>
 
     <div class="card">
@@ -192,7 +209,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         <path class="circle hum-circle" id="hum-ring" stroke-dasharray="0, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
         <text x="18" y="18" class="percentage-text" id="hum-val">--%</text>
       </svg>
-      <div class="label">Humidity</div>
+      <div class="label" data-i18n="humidity">Humidity</div>
     </div>
 
     <div class="card">
@@ -201,30 +218,30 @@ const char index_html[] PROGMEM = R"rawliteral(
         <path class="circle moist-circle" id="moist-ring" stroke-dasharray="0, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
         <text x="18" y="18" class="percentage-text" id="moist-val">--%</text>
       </svg>
-      <div class="label">Soil Moisture</div>
+      <div class="label" data-i18n="soilMoisture">Soil Moisture</div>
     </div>
     
     <div class="control-panel">
-      <div class="label" style="margin-bottom: 15px; margin-top: 0;">Water Pump Control</div>
-      <button id="pumpBtn" onclick="togglePump()">Turn Pump ON</button>
+      <div class="label" data-i18n="pumpControl" style="margin-bottom: 15px; margin-top: 0;">Water Pump Control</div>
+      <button id="pumpBtn" onclick="togglePump()"><span data-i18n="turnPumpOn">Turn Pump ON</span></button>
       <div id="status-msg" style="color: #e74c3c; margin-top: 10px; font-size: 0.95rem; font-weight: bold;"></div>
       
       <div class="settings-panel">
         
         <div style="display: flex; justify-content: center; align-items: center; margin-bottom: 25px;">
-          <span class="mode-label" id="lblManual" style="color: #657e63;">Manual</span>
+          <span class="mode-label" id="lblManual" style="color: #657e63;" data-i18n="manual">Manual</span>
           <label class="switch">
             <input type="checkbox" id="modeToggle" onchange="sendSettings()" checked>
             <span class="slider"></span>
           </label>
-          <span class="mode-label" id="lblAuto" style="color: #8bc34a;">Auto Mode</span>
+          <span class="mode-label" id="lblAuto" style="color: #8bc34a;" data-i18n="autoMode">Auto Mode</span>
         </div>
 
         <div id="thresholdDiv">
-          <label style="color: var(--primary); font-size: 0.95rem;">Turn ON when moisture drops to: <span id="threshStartDisplay" style="font-weight: bold; color: white;">10</span>%</label><br>
+          <label style="color: var(--primary); font-size: 0.95rem;"><span data-i18n="startText">Turn ON when moisture drops to:</span> <span id="threshStartDisplay" style="font-weight: bold; color: white;">10</span>%</label><br>
           <input type="range" id="threshStartSlider" min="0" max="95" value="10" style="width: 85%; margin-bottom: 20px; margin-top: 10px;" onchange="sendSettings()" oninput="document.getElementById('threshStartDisplay').innerText=this.value">
           <br>
-          <label style="color: var(--primary); font-size: 0.95rem;">Turn OFF when moisture hits: <span id="threshStopDisplay" style="font-weight: bold; color: white;">40</span>%</label><br>
+          <label style="color: var(--primary); font-size: 0.95rem;"><span data-i18n="stopText">Turn OFF when moisture hits:</span> <span id="threshStopDisplay" style="font-weight: bold; color: white;">40</span>%</label><br>
           <input type="range" id="threshStopSlider" min="5" max="100" value="40" style="width: 85%; margin-top: 10px;" onchange="sendSettings()" oninput="document.getElementById('threshStopDisplay').innerText=this.value">
         </div>
       </div>
@@ -232,15 +249,37 @@ const char index_html[] PROGMEM = R"rawliteral(
   </div>
 
   <script>
+    const translations = {
+      en: {title:"Smart Plant Monitor", temperature:"Temperature", humidity:"Humidity", soilMoisture:"Soil Moisture", pumpControl:"Water Pump Control", turnPumpOn:"Turn Pump ON", turnPumpOff:"Turn Pump OFF", manual:"Manual", autoMode:"Auto Mode", startText:"Turn ON when moisture drops to:", stopText:"Turn OFF when moisture hits:", manualWarning:"Switch to Manual mode to use this button."},
+      hi: {title:"स्मार्ट प्लांट मॉनिटर", temperature:"तापमान", humidity:"नमी", soilMoisture:"मिट्टी की नमी", pumpControl:"पानी पंप नियंत्रण", turnPumpOn:"पंप चालू करें", turnPumpOff:"पंप बंद करें", manual:"मैनुअल", autoMode:"ऑटो मोड", startText:"नमी कम होने पर चालू करें:", stopText:"नमी पहुँचने पर बंद करें:", manualWarning:"इस बटन का उपयोग करने के लिए मैनुअल मोड चुनें।"},
+      bn: {title:"স্মার্ট প্ল্যান্ট মনিটর", temperature:"তাপমাত্রা", humidity:"আর্দ্রতা", soilMoisture:"মাটির আর্দ্রতা", pumpControl:"জল পাম্প নিয়ন্ত্রণ", turnPumpOn:"পাম্প চালু করুন", turnPumpOff:"পাম্প বন্ধ করুন", manual:"ম্যানুয়াল", autoMode:"অটো মোড", startText:"আর্দ্রতা কমে গেলে চালু করুন:", stopText:"আর্দ্রতা পৌঁছালে বন্ধ করুন:", manualWarning:"এই বোতাম ব্যবহার করতে ম্যানুয়াল মোড নির্বাচন করুন।"}
+    };
+
+    function changeLanguage() {
+      const lang = document.getElementById('languageSelect').value;
+      localStorage.setItem('language', lang);
+      document.querySelectorAll('[data-i18n]').forEach(el => {
+        const key = el.getAttribute('data-i18n');
+        if (translations[lang][key]) el.textContent = translations[lang][key];
+      });
+      syncUIState(document.getElementById('modeToggle').checked, document.getElementById('pumpBtn').classList.contains('pump-on'));
+    }
+
+    function loadLanguage() {
+      const lang = localStorage.getItem('language') || 'en';
+      document.getElementById('languageSelect').value = lang;
+      changeLanguage();
+    }
+
     function syncUIState(isAuto, pumpOn) {
       const btn = document.getElementById('pumpBtn');
       
       // Update Button state
       if(pumpOn) {
-        btn.innerText = 'Turn Pump OFF';
+        btn.innerText = '<span data-i18n="turnPumpOff">Turn Pump OFF</span>';
         btn.classList.add('pump-on');
       } else {
-        btn.innerText = 'Turn Pump ON';
+        btn.innerText = '<span data-i18n="turnPumpOn">Turn Pump ON</span>';
         btn.classList.remove('pump-on');
       }
 
@@ -266,7 +305,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         .then(response => response.text())
         .then(state => {
           if (state === 'blocked_auto') {
-            document.getElementById('status-msg').innerText = 'Switch to Manual mode to use this button.';
+            document.getElementById('status-msg').innerText = translations[document.getElementById('languageSelect').value].manualWarning;
             setTimeout(() => { document.getElementById('status-msg').innerText = ''; }, 3000);
           } else {
             document.getElementById('status-msg').innerText = '';
@@ -295,6 +334,8 @@ const char index_html[] PROGMEM = R"rawliteral(
 
       fetch(`/settings?mode=${mode}&start=${start}&stop=${stop}`);
     }
+
+    loadLanguage();
 
     // Automatically fetch new data every 2 seconds
     setInterval(function() {
@@ -390,6 +431,8 @@ void setup() {
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, HIGH); // Active Low - start OFF
 
+    pinMode(PUMP_BUTTON_PIN, INPUT_PULLUP); // Button pressed = LOW
+
     // 2. Initialize DHT
     dht.begin();
     
@@ -412,6 +455,7 @@ void setup() {
     // Setup SIM800L Call Features
     sendATCommand("ATS0=1", 1000);   // Auto-answer after 1 ring
     sendATCommand("AT+DDET=1", 1000); // Enable DTMF Decoder
+    sendATCommand("AT+CLIP=1", 1000);  // Enable caller-ID reporting
     
     display.clearDisplay();
     display.setCursor(0, 20);
@@ -436,6 +480,7 @@ void setup() {
 }
 
 void loop() {
+    handlePhysicalButton();
     // 1. Handle Web Server Requests
     server.handleClient();
     
@@ -445,6 +490,15 @@ void loop() {
       response.trim();
       
       if (response.length() > 0) {
+        if (response.startsWith("+CLIP:")) {
+          int firstQuote = response.indexOf('"');
+          int secondQuote = response.indexOf('"', firstQuote + 1);
+          if (firstQuote != -1 && secondQuote != -1) {
+            callerNumber = response.substring(firstQuote + 1, secondQuote);
+            Serial.println("Incoming caller: " + callerNumber);
+          }
+        }
+
         if (response.startsWith("+DTMF:")) {
           char keyPressed = response.charAt(7); 
           Serial.print("DTMF PRESSED: "); Serial.println(keyPressed);
@@ -469,6 +523,14 @@ void loop() {
               Serial.println("AUTO MODE (Sensors in control)");
             } else {
               Serial.println("MANUAL MODE (Awaiting commands)");
+            }
+          }
+          else if (keyPressed == '4') {
+            if (callerNumber.length() > 0) {
+              Serial.println("📩 Sending sensor data to caller: " + callerNumber);
+              sendSensorSMS(callerNumber);
+            } else {
+              Serial.println("⚠️ Caller number unavailable. SMS not sent.");
             }
           }
           else {
@@ -552,6 +614,32 @@ void loop() {
 }
 
 // --- Helper Functions ---
+void handlePhysicalButton() {
+    int reading = digitalRead(PUMP_BUTTON_PIN);
+
+    if (reading != lastButtonReading) {
+        lastDebounceTime = millis();
+    }
+
+    if ((millis() - lastDebounceTime) > debounceDelay) {
+        if (reading != stableButtonState) {
+            stableButtonState = reading;
+
+            // Act only when the button is pressed
+            if (stableButtonState == LOW) {
+                // A physical press puts the system into Manual mode
+                isAutoMode = false;
+                pumpIsOn = !pumpIsOn;
+                digitalWrite(RELAY_PIN, pumpIsOn ? LOW : HIGH); // Active Low
+                Serial.println(pumpIsOn ? "Physical button: PUMP ON" : "Physical button: PUMP OFF");
+                updateOLED();
+            }
+        }
+    }
+
+    lastButtonReading = reading;
+}
+
 void updateOLED() {
     display.clearDisplay();
     
@@ -607,6 +695,29 @@ void updateOLED() {
     }
 
     display.display();
+}
+
+void sendSensorSMS(const String &recipient) {
+    if (recipient.length() == 0) return;
+
+    String message = "CALL-FARM STATUS\n";
+    message += "Temp: " + String(temperature, 1) + " C\n";
+    message += "Humidity: " + String(humidity, 1) + " %\n";
+    message += "Soil Moisture: " + String(soilMoisturePercent) + " %\n";
+    message += "Pump: " + String(pumpIsOn ? "ON" : "OFF") + "\n";
+    message += "Mode: " + String(isAutoMode ? "AUTO" : "MANUAL") + "\n";
+    message += "Threshold: " + String(moistureStartThreshold) + "-" + String(moistureStopThreshold) + " %";
+
+    sim800l.println("AT+CMGF=1");
+    delay(500);
+    sim800l.print("AT+CMGS=\"");
+    sim800l.print(recipient);
+    sim800l.println("\"");
+    delay(500);
+    sim800l.print(message);
+    sim800l.write(26); // Ctrl+Z
+    delay(5000);
+    Serial.println("Sensor SMS sent/requested.");
 }
 
 String sendATCommand(String command, const int timeout) {
