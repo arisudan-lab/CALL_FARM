@@ -14,7 +14,10 @@ const char* password = "12345678";
 #define DHTTYPE DHT11       // DHT 11
 #define MOISTURE_PIN 35     // Analog pin for Soil Moisture
 #define RELAY_PIN 26        // Pin for the Relay Module
-#define PUMP_BUTTON_PIN 27  // Physical push button: connect between GPIO27 and GND
+#define PUMP_BUTTON_PIN 27  // Physical pump button: connect between GPIO27 and GND
+#define MODE_BUTTON_PIN 14  // Physical mode button: connect between GPIO14 and GND
+#define START_INC_BUTTON_PIN 25 // Increase automatic ON threshold by 10%
+#define STOP_DEC_BUTTON_PIN 33  // Decrease automatic OFF threshold by 10%
 #define SIM800_RX_PIN 16    // ESP32 RX2
 #define SIM800_TX_PIN 17    // ESP32 TX2
 
@@ -57,8 +60,23 @@ int stableButtonState = HIGH;
 unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 50;
 
+// Physical mode button debounce
+int lastModeButtonReading = HIGH;
+int stableModeButtonState = HIGH;
+unsigned long lastModeDebounceTime = 0;
+
+// Physical threshold button debounce
+int lastStartIncReading = HIGH;
+int stableStartIncState = HIGH;
+unsigned long lastStartIncDebounceTime = 0;
+int lastStopDecReading = HIGH;
+int stableStopDecState = HIGH;
+unsigned long lastStopDecDebounceTime = 0;
+
 void updateOLED();
 void handlePhysicalButton();
+void handleModeButton();
+void handleThresholdButtons();
 String sendATCommand(String command, const int timeout);
 void sendSensorSMS(const String &recipient);
 
@@ -432,6 +450,9 @@ void setup() {
     digitalWrite(RELAY_PIN, HIGH); // Active Low - start OFF
 
     pinMode(PUMP_BUTTON_PIN, INPUT_PULLUP); // Button pressed = LOW
+    pinMode(MODE_BUTTON_PIN, INPUT_PULLUP); // Mode button pressed = LOW
+    pinMode(START_INC_BUTTON_PIN, INPUT_PULLUP); // Increase START threshold
+    pinMode(STOP_DEC_BUTTON_PIN, INPUT_PULLUP);  // Decrease STOP threshold
 
     // 2. Initialize DHT
     dht.begin();
@@ -481,6 +502,8 @@ void setup() {
 
 void loop() {
     handlePhysicalButton();
+    handleModeButton();
+    handleThresholdButtons();
     // 1. Handle Web Server Requests
     server.handleClient();
     
@@ -638,6 +661,87 @@ void handlePhysicalButton() {
     }
 
     lastButtonReading = reading;
+}
+
+void handleModeButton() {
+    int reading = digitalRead(MODE_BUTTON_PIN);
+
+    if (reading != lastModeButtonReading) {
+        lastModeDebounceTime = millis();
+    }
+
+    if ((millis() - lastModeDebounceTime) > debounceDelay) {
+        if (reading != stableModeButtonState) {
+            stableModeButtonState = reading;
+
+            // Act only when the mode button is pressed
+            if (stableModeButtonState == LOW) {
+                isAutoMode = !isAutoMode;
+
+                // When switching to Auto, let the sensor logic decide the pump state
+                if (isAutoMode) {
+                    Serial.println("Physical mode button: AUTO MODE");
+                } else {
+                    Serial.println("Physical mode button: MANUAL MODE");
+                }
+
+                updateOLED();
+            }
+        }
+    }
+
+    lastModeButtonReading = reading;
+}
+
+
+void handleThresholdButtons() {
+    unsigned long now = millis();
+
+    // Increase automatic pump-ON threshold by exactly 10% per press.
+    int startReading = digitalRead(START_INC_BUTTON_PIN);
+    if (startReading != lastStartIncReading) {
+        lastStartIncDebounceTime = now;
+    }
+    if ((now - lastStartIncDebounceTime) > debounceDelay) {
+        if (startReading != stableStartIncState) {
+            stableStartIncState = startReading;
+            if (stableStartIncState == LOW) {
+                moistureStartThreshold += 10;
+                if (moistureStartThreshold > 100) {
+                    moistureStartThreshold = 100;
+                }
+
+                Serial.print("START threshold increased to: ");
+                Serial.print(moistureStartThreshold);
+                Serial.println("%");
+                updateOLED();
+            }
+        }
+    }
+    lastStartIncReading = startReading;
+
+    // Decrease automatic pump-OFF threshold by exactly 10% per press.
+    int stopReading = digitalRead(STOP_DEC_BUTTON_PIN);
+    if (stopReading != lastStopDecReading) {
+        lastStopDecDebounceTime = now;
+    }
+    if ((now - lastStopDecDebounceTime) > debounceDelay) {
+        if (stopReading != stableStopDecState) {
+            stableStopDecState = stopReading;
+            if (stableStopDecState == LOW) {
+                moistureStopThreshold -= 10;
+                if (moistureStopThreshold < 0) {
+                    moistureStopThreshold = 0;
+                }
+
+                Serial.print("STOP threshold decreased to: ");
+                Serial.print(moistureStopThreshold);
+                Serial.println("%");
+                updateOLED();
+            }
+        }
+    }
+    lastStopDecReading = stopReading;
 }
 
 void updateOLED() {
