@@ -707,8 +707,9 @@ void handleThresholdButtons() {
             stableStartIncState = startReading;
             if (stableStartIncState == LOW) {
                 moistureStartThreshold += 10;
+                // After reaching 100%, the next press wraps back to 20%.
                 if (moistureStartThreshold > 100) {
-                    moistureStartThreshold = 100;
+                    moistureStartThreshold = 20;
                 }
 
                 Serial.print("START threshold increased to: ");
