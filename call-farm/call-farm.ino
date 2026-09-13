@@ -44,6 +44,16 @@ String networkName = "Wait..."; // Stores "Kolkata" etc.
 String signalStrength = "0";    // Stores "14" etc.
 String callerNumber = "";       // Last incoming caller number
 
+// --- Call password security ---
+const String CALL_PASSWORD = "2580";   // Change this password
+const int MAX_PASSWORD_ATTEMPTS = 3;
+const unsigned long CALL_AUTH_TIMEOUT = 30000UL;
+String enteredCallPassword = "";
+bool callActive = false;
+bool callAuthenticated = false;
+int failedPasswordAttempts = 0;
+unsigned long callStartMillis = 0;
+
 // --- Settings Variables ---
 bool isAutoMode = true;           // Default to Auto mode
 int moistureStartThreshold = 10;  // Turn ON when moisture drops to this (%)
@@ -79,6 +89,10 @@ void handleModeButton();
 void handleThresholdButtons();
 String sendATCommand(String command, const int timeout);
 void sendSensorSMS(const String &recipient);
+char extractDTMFDigit(const String &response);
+void processCallDTMF(char keyPressed);
+void hangUpCall();
+void resetCallSecurity();
 
 // ==========================================
 // HTML & CSS FOR THE WEBSITE
@@ -504,136 +518,183 @@ void loop() {
     handlePhysicalButton();
     handleModeButton();
     handleThresholdButtons();
-    // 1. Handle Web Server Requests
     server.handleClient();
-    
-    // 2. Handle Incoming DTMF Calls (Phone Override)
-    if (sim800l.available()) {
-      String response = sim800l.readStringUntil('\n');
-      response.trim();
-      
-      if (response.length() > 0) {
+
+    // Read every available SIM800L line, not just one line per loop.
+    while (sim800l.available()) {
+        String response = sim800l.readStringUntil('\n');
+        response.trim();
+        if (response.length() == 0) continue;
+
+        Serial.print("SIM800L: ");
+        Serial.println(response);
+
         if (response.startsWith("+CLIP:")) {
-          int firstQuote = response.indexOf('"');
-          int secondQuote = response.indexOf('"', firstQuote + 1);
-          if (firstQuote != -1 && secondQuote != -1) {
-            callerNumber = response.substring(firstQuote + 1, secondQuote);
-            Serial.println("Incoming caller: " + callerNumber);
-          }
+            int firstQuote = response.indexOf('"');
+            int secondQuote = response.indexOf('"', firstQuote + 1);
+            if (firstQuote >= 0 && secondQuote > firstQuote) {
+                callerNumber = response.substring(firstQuote + 1, secondQuote);
+                callActive = true;
+                callAuthenticated = false;
+                enteredCallPassword = "";
+                failedPasswordAttempts = 0;
+                callStartMillis = millis();
+                Serial.println("Incoming call. Enter password.");
+            }
         }
 
         if (response.startsWith("+DTMF:")) {
-          char keyPressed = response.charAt(7); 
-          Serial.print("DTMF PRESSED: "); Serial.println(keyPressed);
-          
-          if (keyPressed == '1') {
-            isAutoMode = false; // Switch to Manual Mode
-            pumpIsOn = true;
-            digitalWrite(RELAY_PIN, LOW); // Turn ON
-            Serial.println("✅ Pump ON via Call. Switched to Manual Mode.");
-          } 
-          else if (keyPressed == '2') {
-            isAutoMode = false; // Switch to Manual Mode
-            pumpIsOn = false;
-            digitalWrite(RELAY_PIN, HIGH); // Turn OFF
-            Serial.println("❌ Pump OFF via Call. Switched to Manual Mode.");
-          }
-          else if (keyPressed == '3') {
-            isAutoMode = !isAutoMode; // Toggle between Auto and Manual
-            
-            Serial.print("🔄 Mode Toggled via Call. System is now in: ");
-            if (isAutoMode) {
-              Serial.println("AUTO MODE (Sensors in control)");
-            } else {
-              Serial.println("MANUAL MODE (Awaiting commands)");
+            char keyPressed = extractDTMFDigit(response);
+            if (keyPressed >= '0' && keyPressed <= '9') {
+                Serial.print("DTMF PRESSED: ");
+                Serial.println(keyPressed);
+                processCallDTMF(keyPressed);
             }
-          }
-          else if (keyPressed == '4') {
-            if (callerNumber.length() > 0) {
-              Serial.println("📩 Sending sensor data to caller: " + callerNumber);
-              sendSensorSMS(callerNumber);
-            } else {
-              Serial.println("⚠️ Caller number unavailable. SMS not sent.");
-            }
-          }
-          else {
-             Serial.println("⚠️ Unknown button pressed. Ignoring.");
-          }
-          
-          updateOLED(); // Instantly refresh the screen to show the new mode
         }
-      }
+
+        if (response.indexOf("NO CARRIER") >= 0 ||
+            response.indexOf("BUSY") >= 0 ||
+            response.indexOf("NO ANSWER") >= 0) {
+            resetCallSecurity();
+        }
+    }
+
+    if (callActive && !callAuthenticated &&
+        millis() - callStartMillis >= CALL_AUTH_TIMEOUT) {
+        Serial.println("Password timeout. Hanging up.");
+        hangUpCall();
     }
 
     unsigned long currentMillis = millis();
-    
-    // 3. Update Sensors every 2 seconds
+
     if (currentMillis - previousMillis >= sensorInterval) {
         previousMillis = currentMillis;
-
         humidity = dht.readHumidity();
         temperature = dht.readTemperature();
         soilMoistureRaw = analogRead(MOISTURE_PIN);
-        
         soilMoisturePercent = map(soilMoistureRaw, 4095, 1500, 0, 100);
         soilMoisturePercent = constrain(soilMoisturePercent, 0, 100);
-        
+
         if (isnan(humidity) || isnan(temperature)) {
             humidity = 0;
             temperature = 0;
             Serial.println("Failed to read from DHT sensor!");
         }
 
-        // ==========================================
-        // DUAL-THRESHOLD AUTO LOGIC
-        // ==========================================
         if (isAutoMode) {
-            // Turn ON condition
             if (!pumpIsOn && soilMoisturePercent <= moistureStartThreshold) {
                 pumpIsOn = true;
-                digitalWrite(RELAY_PIN, LOW); // Turn ON (Active Low)
-                Serial.println("Moisture dropped below START threshold. Pump auto-started.");
-            } 
-            // Turn OFF condition
-            else if (pumpIsOn && soilMoisturePercent >= moistureStopThreshold) {
+                digitalWrite(RELAY_PIN, LOW);
+                Serial.println("Moisture below START threshold. Pump ON.");
+            } else if (pumpIsOn && soilMoisturePercent >= moistureStopThreshold) {
                 pumpIsOn = false;
-                digitalWrite(RELAY_PIN, HIGH); // Turn OFF
-                Serial.println("Moisture reached STOP threshold. Pump auto-stopped.");
+                digitalWrite(RELAY_PIN, HIGH);
+                Serial.println("Moisture reached STOP threshold. Pump OFF.");
             }
         }
 
         updateOLED();
-        
-        // Serial Debugging
-        Serial.printf("Temp: %.1fC | Hum: %.1f%% | Moist: %d%% | Pump: %s | Mode: %s | Start: %d%% | Stop: %d%%\n", 
-                      temperature, humidity, soilMoisturePercent, 
+        Serial.printf("Temp: %.1fC | Hum: %.1f%% | Moist: %d%% | Pump: %s | Mode: %s | Start: %d%% | Stop: %d%%\n",
+                      temperature, humidity, soilMoisturePercent,
                       pumpIsOn ? "ON" : "OFF", isAutoMode ? "AUTO" : "MANUAL",
                       moistureStartThreshold, moistureStopThreshold);
     }
-    
-    // 4. Fetch Signal and Network Data every 10 seconds
+
     if (currentMillis - previousSimMillis >= simInterval) {
         previousSimMillis = currentMillis;
-        
-        // Get Signal Strength
         String csqResponse = sendATCommand("AT+CSQ", 1000);
         int csqIndex = csqResponse.indexOf("+CSQ: ");
         if (csqIndex != -1) {
             int commaIndex = csqResponse.indexOf(",", csqIndex);
-            signalStrength = csqResponse.substring(csqIndex + 6, commaIndex);
+            if (commaIndex > csqIndex) signalStrength = csqResponse.substring(csqIndex + 6, commaIndex);
         }
-        
-        // Get Network Operator
+
         String copsResponse = sendATCommand("AT+COPS?", 2000);
-        int quoteStart = copsResponse.indexOf("\"");
-        int quoteEnd = copsResponse.lastIndexOf("\"");
-        if (quoteStart != -1 && quoteEnd != -1 && quoteStart != quoteEnd) {
-            networkName = copsResponse.substring(quoteStart + 1, quoteEnd);
-        } else {
-            networkName = "Searching...";
-        }
+        int quoteStart = copsResponse.indexOf('"');
+        int quoteEnd = copsResponse.lastIndexOf('"');
+        if (quoteStart != -1 && quoteEnd > quoteStart) networkName = copsResponse.substring(quoteStart + 1, quoteEnd);
+        else networkName = "Searching...";
         updateOLED();
     }
+}
+
+char extractDTMFDigit(const String &response) {
+    int colon = response.indexOf(':');
+    if (colon < 0) return '\0';
+    for (int i = colon + 1; i < response.length(); i++) {
+        char c = response.charAt(i);
+        if (c >= '0' && c <= '9') return c;
+    }
+    return '\0';
+}
+
+void resetCallSecurity() {
+    callActive = false;
+    callAuthenticated = false;
+    enteredCallPassword = "";
+    failedPasswordAttempts = 0;
+    callStartMillis = 0;
+}
+
+void hangUpCall() {
+    Serial.println("Hanging up call...");
+    sim800l.println("ATH");
+    delay(500);
+    resetCallSecurity();
+}
+
+void processCallDTMF(char keyPressed) {
+    if (!callActive) {
+        Serial.println("Ignoring DTMF: no active call.");
+        return;
+    }
+
+    if (!callAuthenticated) {
+        enteredCallPassword += keyPressed;
+        Serial.print("Password digits received: ");
+        Serial.println(enteredCallPassword.length());
+
+        if (enteredCallPassword.length() == CALL_PASSWORD.length()) {
+            if (enteredCallPassword == CALL_PASSWORD) {
+                callAuthenticated = true;
+                enteredCallPassword = "";
+                failedPasswordAttempts = 0;
+                Serial.println("Password correct. Remote control unlocked.");
+            } else {
+                failedPasswordAttempts++;
+                enteredCallPassword = "";
+                Serial.print("Wrong password attempt: ");
+                Serial.println(failedPasswordAttempts);
+
+                if (failedPasswordAttempts >= MAX_PASSWORD_ATTEMPTS) {
+                    Serial.println("Maximum failed attempts reached. Disconnecting.");
+                    delay(300);
+                    hangUpCall();
+                }
+            }
+        }
+        return;
+    }
+
+    if (keyPressed == '1') {
+        isAutoMode = false;
+        pumpIsOn = true;
+        digitalWrite(RELAY_PIN, LOW);
+        Serial.println("Authenticated call: Pump ON, Manual mode.");
+    } else if (keyPressed == '2') {
+        isAutoMode = false;
+        pumpIsOn = false;
+        digitalWrite(RELAY_PIN, HIGH);
+        Serial.println("Authenticated call: Pump OFF, Manual mode.");
+    } else if (keyPressed == '3') {
+        isAutoMode = !isAutoMode;
+        Serial.println(isAutoMode ? "Authenticated call: AUTO mode." : "Authenticated call: MANUAL mode.");
+    } else if (keyPressed == '4') {
+        if (callerNumber.length() > 0) sendSensorSMS(callerNumber);
+    } else {
+        Serial.println("Unknown authenticated command.");
+    }
+    updateOLED();
 }
 
 // --- Helper Functions ---
